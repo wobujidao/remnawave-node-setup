@@ -140,6 +140,8 @@ systemctl daemon-reload
 
 ## 4. DNS over TLS
 
+### 4.1 Настройка
+
 ```bash
 cat > /etc/systemd/resolved.conf << 'EOF'
 [Resolve]
@@ -151,16 +153,62 @@ EOF
 systemctl restart systemd-resolved
 ```
 
-### Проверка DoT
+### 4.2 Проверка DoT
+
+**Тест 1: Проверка шифрования запроса**
 
 ```bash
 resolvectl query google.com
 ```
 
-**Ожидаемый результат:**
+Ожидаемый результат:
 ```
-Data was acquired via local or encrypted transport: yes
+google.com: 142.250.184.238                    -- link: ens3
+
+-- Information acquired via protocol DNS in 9.9ms.
+-- Data is authenticated: no; Data was acquired via local or encrypted transport: yes
+                                                                           ^^^
+                                                                      СМОТРИ СЮДА
+-- Data from: network
 ```
+
+🔑 **Ключевой параметр: `encrypted transport: yes`**
+
+| Значение | Что означает |
+|----------|--------------|
+| `yes` | ✅ DNS запросы **шифруются через TLS** — DoT работает |
+| `no` | ❌ Запросы идут **открытым текстом** — DoT не работает |
+
+> 💡 **Пояснение:** Формулировка `local or encrypted` означает способ передачи. `local` — через локальный резолвер (127.0.0.53), `encrypted` — шифрование TLS. При работающем DoT запрос идёт через локальный stub-резолвер, который затем шифрует его через TLS к DNS-серверу (Cloudflare/Google).
+
+**Тест 2: Статус службы resolved**
+
+```bash
+resolvectl status
+```
+
+Ожидаемый результат:
+```
+Global
+         Protocols: -LLMNR -mDNS +DNSOverTLS DNSSEC=allow-downgrade/supported
+                                 ^^^^^^^^^^^
+                                 DoT ВКЛЮЧЁН
+  resolv.conf mode: stub
+Current DNS Server: 1.1.1.1#cloudflare-dns.com
+       DNS Servers: 1.1.1.1#cloudflare-dns.com 1.0.0.1#cloudflare-dns.com ...
+```
+
+✅ **`+DNSOverTLS`** = протокол DNS-over-TLS активен  
+✅ **`Current DNS Server: 1.1.1.1#cloudflare-dns.com`** = используется Cloudflare DoT
+
+### 4.3 Расшифровка результатов
+
+| Параметр | Значение | Статус |
+|----------|----------|--------|
+| `encrypted transport: yes` | DNS запросы шифруются | ✅ DoT работает |
+| `encrypted transport: no` | Запросы идут открытым текстом | ❌ Проверить конфиг |
+| `+DNSOverTLS` | Протокол включён глобально | ✅ Настроено верно |
+| `-DNSOverTLS` | Протокол выключен | ❌ Проверить resolved.conf |
 
 ---
 
@@ -307,7 +355,7 @@ mkdir -p /opt/remnanode && cd /opt/remnanode
 ### 9.3 Создание docker-compose.yml
 
 ```bash
-cd /opt/remnanode && nano docker-compose.yml
+mcedit /opt/remnanode/docker-compose.yml
 ```
 
 Вставьте скопированную конфигурацию из панели. Пример структуры:
@@ -527,8 +575,12 @@ docker ps
 # Порты
 ss -tlpn | grep -E ':443|:8443'
 
-# DNS
+# DNS over TLS
 resolvectl query google.com
+# Ожидается: "encrypted transport: yes"
+
+resolvectl status | grep -E "DNSOverTLS|Current DNS"
+# Ожидается: "+DNSOverTLS" и "Current DNS Server: 1.1.1.1#cloudflare-dns.com"
 ```
 
 ### 12.2 Проверка Xray
