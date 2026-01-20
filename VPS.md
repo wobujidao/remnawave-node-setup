@@ -11,8 +11,9 @@
 7. [Fail2ban](#7-fail2ban)
 8. [TLS сканирование](#8-tls-сканирование)
 9. [Установка Remnanode](#9-установка-remnanode)
-10. [Настройка в панели Remnawave](#10-настройка-в-панели-remnawave)
-11. [Проверка работоспособности](#11-проверка-работоспособности)
+10. [Настройка логирования](#10-настройка-логирования)
+11. [Настройка в панели Remnawave](#11-настройка-в-панели-remnawave)
+12. [Проверка работоспособности](#12-проверка-работоспособности)
 
 ---
 
@@ -61,11 +62,17 @@ timedatectl
 
 ## 2. Установка Docker
 
+Используем официальный скрипт установки Docker:
+
 ```bash
-apt install -y docker.io docker-compose-v2
-systemctl enable docker
-systemctl start docker
+curl -fsSL https://get.docker.com | sh
+```
+
+Проверка:
+
+```bash
 docker --version
+docker compose version
 ```
 
 ---
@@ -186,10 +193,19 @@ apt install -y ufw
 
 ufw allow 22/tcp comment 'SSH'
 ufw allow 443/tcp comment 'VLESS Reality'
-ufw allow 8443/tcp comment 'Remnanode API'
 ufw --force enable
 ufw status
 ```
+
+### Важно: NODE_PORT
+
+NODE_PORT (по умолчанию 8443) должен быть открыт **только для IP панели Remnawave**:
+
+```bash
+ufw allow from <IP_REMNAWAVE_PANEL> to any port 8443 proto tcp comment 'Remnanode API'
+```
+
+> ⚠️ **Не открывайте NODE_PORT для всех!** Это внутренний API для связи панели с нодой.
 
 ### Если несколько IP на сервере
 
@@ -277,68 +293,62 @@ HTTP/2 302
 mkdir -p /opt/remnanode && cd /opt/remnanode
 ```
 
-### 9.2 Генерация ключей
+### 9.2 Создание ноды в панели Remnawave
+
+1. Откройте панель Remnawave
+2. Перейдите в **Nodes** → **Management**
+3. Нажмите кнопку **+** для добавления новой ноды
+4. Заполните форму:
+   - **Name:** Название ноды (например: `DE-Frankfurt-01`)
+   - **Address:** IP адрес сервера
+   - **Node Port:** Порт для внутреннего API (по умолчанию `8443`)
+5. Нажмите **Copy docker-compose.yml** для копирования конфигурации
+
+### 9.3 Создание docker-compose.yml
 
 ```bash
-docker run --rm remnawave/node:latest xray x25519
+cd /opt/remnanode && nano docker-compose.yml
 ```
 
-**Пример вывода:**
-```
-PrivateKey: aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890abcdefg
-Password: XyZ1234567890abcdefgaBcDeFgHiJkLmNoPqRsTuVw   <-- Это PublicKey!
-```
+Вставьте скопированную конфигурацию из панели. Пример структуры:
 
-> ⚠️ **Важно:** Сохраните оба ключа! PrivateKey — в конфиг inbound, PublicKey — в настройки хоста.
-
-### 9.3 Генерация ShortIds
-
-```bash
-openssl rand -hex 8
-openssl rand -hex 8
-openssl rand -hex 8
-openssl rand -hex 8
-```
-
-**Пример вывода:**
-```
-a1b2c3d4e5f67890
-1234567890abcdef
-fedcba0987654321
-0f1e2d3c4b5a6978
-```
-
-### 9.4 Создание docker-compose.yml
-
-```bash
-cat > /opt/remnanode/docker-compose.yml << 'EOF'
+```yaml
 services:
   remnanode:
-    image: remnawave/node:latest
     container_name: remnanode
-    restart: always
+    hostname: remnanode
+    image: remnawave/node:latest
     network_mode: host
+    restart: always
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    environment:
+      - NODE_PORT=8443
+      - SECRET_KEY="<YOUR_SECRET_KEY>"
     volumes:
       - /var/log/remnanode:/var/log/remnanode
-    environment:
-      - APP_PORT=61001
-      - SSL_CERT=
-      - SSL_KEY=
-      - NODE_TYPE=XRAY
-      - API_SECRET=<СЕКРЕТ_ИЗ_ПАНЕЛИ_REMNAWAVE>
-EOF
 ```
 
-> ⚠️ Замените `<СЕКРЕТ_ИЗ_ПАНЕЛИ_REMNAWAVE>` на реальный секрет из панели.
+> ⚠️ **Важно:** Параметр `volumes` обязателен для работы логирования!
+
+> ⚠️ **Важно:** Используйте конфигурацию из панели! Она содержит правильный SECRET_KEY.
+
+### 9.4 Создание директории для логов
+
+```bash
+mkdir -p /var/log/remnanode
+```
 
 ### 9.5 Запуск контейнера
 
 ```bash
 cd /opt/remnanode
-docker compose pull
-docker compose up -d
-docker logs remnanode --tail 20
+docker compose up -d && docker compose logs -f -t
 ```
+
+Нажмите `Ctrl+C` для выхода из просмотра логов.
 
 ### 9.6 Автообновление ноды (суббота 11:00 MSK)
 
@@ -351,13 +361,77 @@ chmod 644 /etc/cron.d/remnawave-update
 
 ---
 
-## 10. Настройка в панели Remnawave
+## 10. Настройка логирования
 
-### 10.1 Конфиг Inbound
+### 10.1 Установка logrotate
+
+```bash
+apt install -y logrotate
+```
+
+### 10.2 Конфигурация ротации логов
+
+```bash
+cat > /etc/logrotate.d/remnanode << 'EOF'
+/var/log/remnanode/*.log {
+    size 50M
+    rotate 5
+    compress
+    missingok
+    notifempty
+    copytruncate
+}
+EOF
+```
+
+### 10.3 Проверка конфигурации
+
+```bash
+logrotate -vf /etc/logrotate.d/remnanode
+```
+
+> ⚠️ **Важно:** Обязательно настройте ротацию логов, иначе они заполнят диск!
+
+---
+
+## 11. Настройка в панели Remnawave
+
+### 11.1 Завершение создания ноды
+
+1. В карточке создания ноды нажмите **Next**
+2. Выберите нужный **Config Profile**
+3. Нажмите **Create**
+
+### 11.2 Генерация ключей для Reality
+
+В панели автоматически генерируются ключи. Если нужно сгенерировать вручную:
+
+```bash
+docker exec remnanode xray x25519
+```
+
+**Пример вывода:**
+```
+PrivateKey: aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890abcdefg
+Password: XyZ1234567890abcdefgaBcDeFgHiJkLmNoPqRsTuVw   <-- Это PublicKey!
+```
+
+### 11.3 Генерация ShortIds
+
+```bash
+openssl rand -hex 8
+openssl rand -hex 8
+openssl rand -hex 8
+openssl rand -hex 8
+```
+
+### 11.4 Конфиг Inbound
 
 ```json
 {
   "log": {
+    "error": "/var/log/remnanode/error.log",
+    "access": "/var/log/remnanode/access.log",
     "loglevel": "warning"
   },
   "inbounds": [
@@ -415,7 +489,7 @@ chmod 644 /etc/cron.d/remnawave-update
 }
 ```
 
-### 10.2 Если несколько IP на сервере
+### 11.5 Если несколько IP на сервере
 
 Измените `listen` на конкретный IP:
 
@@ -423,7 +497,7 @@ chmod 644 /etc/cron.d/remnawave-update
 "listen": "<YOUR_VPN_IP>",
 ```
 
-### 10.3 Настройки хоста
+### 11.6 Настройки хоста
 
 | Параметр | Значение |
 |----------|----------|
@@ -438,9 +512,9 @@ chmod 644 /etc/cron.d/remnawave-update
 
 ---
 
-## 11. Проверка работоспособности
+## 12. Проверка работоспособности
 
-### 11.1 После перезагрузки
+### 12.1 После перезагрузки
 
 ```bash
 # Лимиты
@@ -451,19 +525,26 @@ cat /proc/sys/net/netfilter/nf_conntrack_max # Ожидается: 262144
 docker ps
 
 # Порты
-ss -tlpn | grep 443
+ss -tlpn | grep -E ':443|:8443'
 
 # DNS
 resolvectl query google.com
 ```
 
-### 11.2 Проверка Xray
+### 12.2 Проверка Xray
 
 ```bash
 docker logs remnanode --tail 30
 ```
 
-### 11.3 Тест подключения
+### 12.3 Проверка логов
+
+```bash
+tail -f /var/log/remnanode/error.log
+tail -f /var/log/remnanode/access.log
+```
+
+### 12.4 Тест подключения
 
 Подключитесь через VPN-клиент и проверьте IP:
 - https://2ip.ru
@@ -475,8 +556,8 @@ docker logs remnanode --tail 30
 
 ```bash
 apt update && apt upgrade -y && \
-apt install -y docker.io docker-compose-v2 ufw fail2ban mc htop btop iftop unattended-upgrades curl wget && \
-systemctl enable docker && systemctl start docker && \
+curl -fsSL https://get.docker.com | sh && \
+apt install -y ufw fail2ban mc htop btop iftop unattended-upgrades curl wget logrotate && \
 timedatectl set-timezone Europe/Moscow && \
 cat >> /etc/sysctl.conf << 'EOF'
 
@@ -530,11 +611,38 @@ cp /etc/fail2ban/jail.conf /etc/fail2ban/jail.local && \
 systemctl enable fail2ban && systemctl restart fail2ban && \
 ufw allow 22/tcp comment 'SSH' && \
 ufw allow 443/tcp comment 'VLESS Reality' && \
-ufw allow 8443/tcp comment 'Remnanode API' && \
 ufw --force enable && \
+mkdir -p /opt/remnanode /var/log/remnanode && \
+cat > /etc/logrotate.d/remnanode << 'EOF'
+/var/log/remnanode/*.log {
+    size 50M
+    rotate 5
+    compress
+    missingok
+    notifempty
+    copytruncate
+}
+EOF
+cat > /etc/cron.d/remnawave-update << 'EOF'
+0 11 * * 6 root cd /opt/remnanode && docker compose pull -q && docker compose down && docker compose up -d >> /var/log/remnawave-update.log 2>&1
+EOF
+chmod 644 /etc/cron.d/remnawave-update && \
 systemctl daemon-reload && \
-echo "=== Готово! Перезагрузите сервер: reboot ==="
+echo "=== Готово! ===" && \
+echo "1. Перезагрузите сервер: reboot" && \
+echo "2. После перезагрузки создайте ноду в панели Remnawave" && \
+echo "3. Скопируйте docker-compose.yml из панели в /opt/remnanode/" && \
+echo "4. Запустите: cd /opt/remnanode && docker compose up -d" && \
+echo "5. Не забудьте открыть NODE_PORT только для IP панели!"
 ```
+
+---
+
+## 📚 Полезные ссылки
+
+- [Официальная документация Remnawave Node](https://docs.rw/docs/install/remnawave-node)
+- [Remnawave Telegram](https://t.me/remnawave)
+- [Xray-core GitHub](https://github.com/XTLS/Xray-core)
 
 ---
 
