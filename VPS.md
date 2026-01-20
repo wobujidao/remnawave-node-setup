@@ -1,0 +1,541 @@
+# 🖥️ Полная инструкция по настройке VPN-ноды
+
+## 📋 Содержание
+
+1. [Подготовка сервера](#1-подготовка-сервера)
+2. [Установка Docker](#2-установка-docker)
+3. [Оптимизация системы](#3-оптимизация-системы)
+4. [DNS over TLS](#4-dns-over-tls)
+5. [Автоматические обновления ОС](#5-автоматические-обновления-ос)
+6. [Firewall (UFW)](#6-firewall-ufw)
+7. [Fail2ban](#7-fail2ban)
+8. [TLS сканирование](#8-tls-сканирование)
+9. [Установка Remnanode](#9-установка-remnanode)
+10. [Настройка в панели Remnawave](#10-настройка-в-панели-remnawave)
+11. [Проверка работоспособности](#11-проверка-работоспособности)
+
+---
+
+## 1. Подготовка сервера
+
+### 1.1 Проверка базовой информации
+
+```bash
+# Информация об ОС
+cat /etc/os-release | head -3
+
+# IP адреса
+ip a
+
+# Геолокация IP
+curl -s https://ipinfo.io/$(hostname -I | awk '{print $1}')
+
+# Текущие лимиты
+echo "=== Limits ==="
+ulimit -n
+cat /proc/sys/net/core/somaxconn
+cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null || echo "conntrack not loaded"
+
+# Проверка Docker
+docker --version 2>/dev/null || echo "Docker not installed"
+
+# Занятые порты
+ss -tulpn | grep -E ':22|:80|:443'
+```
+
+### 1.2 Обновление системы
+
+```bash
+apt update && apt upgrade -y
+apt install -y mc htop btop iftop curl wget
+```
+
+### 1.3 Настройка часового пояса
+
+```bash
+timedatectl set-timezone Europe/Moscow
+timedatectl
+```
+
+---
+
+## 2. Установка Docker
+
+```bash
+apt install -y docker.io docker-compose-v2
+systemctl enable docker
+systemctl start docker
+docker --version
+```
+
+---
+
+## 3. Оптимизация системы
+
+### 3.1 Сетевые параметры ядра
+
+```bash
+cat >> /etc/sysctl.conf << 'EOF'
+
+# VPN Optimization
+net.core.somaxconn = 65535
+net.core.netdev_max_backlog = 65535
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.ipv4.tcp_rmem = 4096 87380 16777216
+net.ipv4.tcp_wmem = 4096 65536 16777216
+net.ipv4.tcp_max_syn_backlog = 65535
+net.ipv4.ip_local_port_range = 1024 65535
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_tw_reuse = 1
+net.netfilter.nf_conntrack_max = 262144
+EOF
+
+sysctl -p
+```
+
+### 3.2 Лимиты файловых дескрипторов
+
+```bash
+cat >> /etc/security/limits.conf << 'EOF'
+* soft nofile 300000
+* hard nofile 300000
+root soft nofile 300000
+root hard nofile 300000
+EOF
+```
+
+### 3.3 Лимиты для systemd
+
+```bash
+mkdir -p /etc/systemd/system.conf.d/
+cat > /etc/systemd/system.conf.d/limits.conf << 'EOF'
+[Manager]
+DefaultLimitNOFILE=300000
+EOF
+```
+
+### 3.4 Автозагрузка модуля conntrack
+
+```bash
+echo "nf_conntrack" >> /etc/modules-load.d/conntrack.conf
+```
+
+### 3.5 Применение изменений
+
+```bash
+systemctl daemon-reload
+```
+
+> ⚠️ **Важно:** Для полного применения лимитов требуется перезагрузка сервера.
+
+---
+
+## 4. DNS over TLS
+
+```bash
+cat > /etc/systemd/resolved.conf << 'EOF'
+[Resolve]
+DNS=1.1.1.1#cloudflare-dns.com 1.0.0.1#cloudflare-dns.com 8.8.8.8#dns.google 8.8.4.4#dns.google
+DNSOverTLS=yes
+DNSSEC=allow-downgrade
+EOF
+
+systemctl restart systemd-resolved
+```
+
+### Проверка DoT
+
+```bash
+resolvectl query google.com
+```
+
+**Ожидаемый результат:**
+```
+Data was acquired via local or encrypted transport: yes
+```
+
+---
+
+## 5. Автоматические обновления ОС
+
+```bash
+apt install -y unattended-upgrades
+
+cat > /etc/apt/apt.conf.d/50unattended-upgrades << 'EOF'
+Unattended-Upgrade::Allowed-Origins {
+    "${distro_id}:${distro_codename}";
+    "${distro_id}:${distro_codename}-security";
+    "${distro_id}:${distro_codename}-updates";
+};
+Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
+Unattended-Upgrade::Remove-New-Unused-Dependencies "true";
+Unattended-Upgrade::Remove-Unused-Dependencies "true";
+Unattended-Upgrade::Automatic-Reboot "true";
+Unattended-Upgrade::Automatic-Reboot-WithUsers "true";
+Unattended-Upgrade::Automatic-Reboot-Time "04:00";
+EOF
+```
+
+---
+
+## 6. Firewall (UFW)
+
+```bash
+apt install -y ufw
+
+ufw allow 22/tcp comment 'SSH'
+ufw allow 443/tcp comment 'VLESS Reality'
+ufw allow 8443/tcp comment 'Remnanode API'
+ufw --force enable
+ufw status
+```
+
+### Если несколько IP на сервере
+
+Для привязки порта к конкретному IP:
+
+```bash
+ufw allow in to <YOUR_VPN_IP> port 443 proto tcp comment 'VLESS Reality'
+```
+
+---
+
+## 7. Fail2ban
+
+```bash
+apt install -y fail2ban
+cp /etc/fail2ban/jail.conf /etc/fail2ban/jail.local
+systemctl enable fail2ban
+systemctl restart fail2ban
+systemctl status fail2ban
+```
+
+---
+
+## 8. TLS сканирование
+
+### 8.1 Скачивание сканера
+
+```bash
+wget -q https://github.com/XTLS/RealiTLScanner/releases/latest/download/RealiTLScanner-linux-64 -O /tmp/RealiTLScanner
+chmod +x /tmp/RealiTLScanner
+```
+
+### 8.2 Сканирование соседних IP
+
+```bash
+/tmp/RealiTLScanner -addr <YOUR_IP> -thread 30 | head -50
+```
+
+### 8.3 Критерии выбора домена для маскировки
+
+**✅ Подходят:**
+- TLS 1.3 + ALPN h2
+- Крупные компании (Apple, Microsoft, Python, IGN, Nvidia)
+- Без редиректа (HTTP 200)
+
+**❌ НЕ подходят:**
+- Cloudflare, Discord (популярные для VPN — палятся)
+- Домены с редиректом (301, 302)
+- Let's Encrypt сертификаты (выглядят как VPN)
+
+### 8.4 Проверка на редирект
+
+```bash
+curl -sI https://example.com | head -3
+```
+
+**Хороший ответ:**
+```
+HTTP/2 200
+```
+
+**Плохой ответ (редирект):**
+```
+HTTP/2 301
+HTTP/2 302
+```
+
+### 8.5 Рекомендуемые домены
+
+| Домен | Издатель | Статус |
+|-------|----------|--------|
+| www.python.org | GlobalSign | ✅ |
+| images.apple.com | Apple Inc. | ✅ |
+| www.nvidia.com | DigiCert | ✅ |
+| ign.com | GlobalSign | ⚠️ Проверить |
+| www.microsoft.com | Microsoft | ⚠️ Проверить |
+
+---
+
+## 9. Установка Remnanode
+
+### 9.1 Создание директории
+
+```bash
+mkdir -p /opt/remnanode && cd /opt/remnanode
+```
+
+### 9.2 Генерация ключей
+
+```bash
+docker run --rm remnawave/node:latest xray x25519
+```
+
+**Пример вывода:**
+```
+PrivateKey: aBcDeFgHiJkLmNoPqRsTuVwXyZ1234567890abcdefg
+Password: XyZ1234567890abcdefgaBcDeFgHiJkLmNoPqRsTuVw   <-- Это PublicKey!
+```
+
+> ⚠️ **Важно:** Сохраните оба ключа! PrivateKey — в конфиг inbound, PublicKey — в настройки хоста.
+
+### 9.3 Генерация ShortIds
+
+```bash
+openssl rand -hex 8
+openssl rand -hex 8
+openssl rand -hex 8
+openssl rand -hex 8
+```
+
+**Пример вывода:**
+```
+a1b2c3d4e5f67890
+1234567890abcdef
+fedcba0987654321
+0f1e2d3c4b5a6978
+```
+
+### 9.4 Создание docker-compose.yml
+
+```bash
+cat > /opt/remnanode/docker-compose.yml << 'EOF'
+services:
+  remnanode:
+    image: remnawave/node:latest
+    container_name: remnanode
+    restart: always
+    network_mode: host
+    volumes:
+      - /var/log/remnanode:/var/log/remnanode
+    environment:
+      - APP_PORT=61001
+      - SSL_CERT=
+      - SSL_KEY=
+      - NODE_TYPE=XRAY
+      - API_SECRET=<СЕКРЕТ_ИЗ_ПАНЕЛИ_REMNAWAVE>
+EOF
+```
+
+> ⚠️ Замените `<СЕКРЕТ_ИЗ_ПАНЕЛИ_REMNAWAVE>` на реальный секрет из панели.
+
+### 9.5 Запуск контейнера
+
+```bash
+cd /opt/remnanode
+docker compose pull
+docker compose up -d
+docker logs remnanode --tail 20
+```
+
+### 9.6 Автообновление ноды (суббота 11:00 MSK)
+
+```bash
+cat > /etc/cron.d/remnawave-update << 'EOF'
+0 11 * * 6 root cd /opt/remnanode && docker compose pull -q && docker compose down && docker compose up -d >> /var/log/remnawave-update.log 2>&1
+EOF
+chmod 644 /etc/cron.d/remnawave-update
+```
+
+---
+
+## 10. Настройка в панели Remnawave
+
+### 10.1 Конфиг Inbound
+
+```json
+{
+  "log": {
+    "loglevel": "warning"
+  },
+  "inbounds": [
+    {
+      "tag": "VLESS_TCP_Reality_<НАЗВАНИЕ>",
+      "port": 443,
+      "listen": "0.0.0.0",
+      "protocol": "vless",
+      "settings": {
+        "clients": [],
+        "decryption": "none"
+      },
+      "sniffing": {
+        "enabled": true,
+        "destOverride": ["http", "tls", "quic"]
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "show": false,
+          "dest": "<ДОМЕН>:443",
+          "xver": 0,
+          "serverNames": ["<ДОМЕН>"],
+          "privateKey": "<PRIVATE_KEY>",
+          "shortIds": ["<SHORT_ID_1>", "<SHORT_ID_2>", "<SHORT_ID_3>", "<SHORT_ID_4>"]
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "protocol": "freedom",
+      "tag": "DIRECT"
+    },
+    {
+      "protocol": "blackhole",
+      "tag": "BLOCK"
+    }
+  ],
+  "routing": {
+    "rules": [
+      {
+        "ip": ["geoip:private"],
+        "outboundTag": "BLOCK",
+        "type": "field"
+      },
+      {
+        "protocol": ["bittorrent"],
+        "outboundTag": "BLOCK",
+        "type": "field"
+      }
+    ]
+  }
+}
+```
+
+### 10.2 Если несколько IP на сервере
+
+Измените `listen` на конкретный IP:
+
+```json
+"listen": "<YOUR_VPN_IP>",
+```
+
+### 10.3 Настройки хоста
+
+| Параметр | Значение |
+|----------|----------|
+| Название | 🇩🇪 DE-Frankfurt-01 |
+| Адрес | `<IP_СЕРВЕРА>` |
+| Порт | `443` |
+| SNI | `<ДОМЕН>` |
+| PublicKey | `<PUBLIC_KEY>` |
+| ShortId | `<ОДИН_ИЗ_SHORT_IDS>` |
+| Fingerprint | `chrome` |
+| ALPN | `h2` |
+
+---
+
+## 11. Проверка работоспособности
+
+### 11.1 После перезагрузки
+
+```bash
+# Лимиты
+ulimit -n                                    # Ожидается: 300000
+cat /proc/sys/net/netfilter/nf_conntrack_max # Ожидается: 262144
+
+# Docker
+docker ps
+
+# Порты
+ss -tlpn | grep 443
+
+# DNS
+resolvectl query google.com
+```
+
+### 11.2 Проверка Xray
+
+```bash
+docker logs remnanode --tail 30
+```
+
+### 11.3 Тест подключения
+
+Подключитесь через VPN-клиент и проверьте IP:
+- https://2ip.ru
+- https://whoer.net
+
+---
+
+## 🔧 Быстрая команда "всё в одном"
+
+```bash
+apt update && apt upgrade -y && \
+apt install -y docker.io docker-compose-v2 ufw fail2ban mc htop btop iftop unattended-upgrades curl wget && \
+systemctl enable docker && systemctl start docker && \
+timedatectl set-timezone Europe/Moscow && \
+cat >> /etc/sysctl.conf << 'EOF'
+
+# VPN Optimization
+net.core.somaxconn = 65535
+net.core.netdev_max_backlog = 65535
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.ipv4.tcp_rmem = 4096 87380 16777216
+net.ipv4.tcp_wmem = 4096 65536 16777216
+net.ipv4.tcp_max_syn_backlog = 65535
+net.ipv4.ip_local_port_range = 1024 65535
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_tw_reuse = 1
+net.netfilter.nf_conntrack_max = 262144
+EOF
+sysctl -p && \
+cat >> /etc/security/limits.conf << 'EOF'
+* soft nofile 300000
+* hard nofile 300000
+root soft nofile 300000
+root hard nofile 300000
+EOF
+mkdir -p /etc/systemd/system.conf.d/ && \
+cat > /etc/systemd/system.conf.d/limits.conf << 'EOF'
+[Manager]
+DefaultLimitNOFILE=300000
+EOF
+echo "nf_conntrack" >> /etc/modules-load.d/conntrack.conf && \
+cat > /etc/systemd/resolved.conf << 'EOF'
+[Resolve]
+DNS=1.1.1.1#cloudflare-dns.com 1.0.0.1#cloudflare-dns.com 8.8.8.8#dns.google 8.8.4.4#dns.google
+DNSOverTLS=yes
+DNSSEC=allow-downgrade
+EOF
+systemctl restart systemd-resolved && \
+cat > /etc/apt/apt.conf.d/50unattended-upgrades << 'EOF'
+Unattended-Upgrade::Allowed-Origins {
+    "${distro_id}:${distro_codename}";
+    "${distro_id}:${distro_codename}-security";
+    "${distro_id}:${distro_codename}-updates";
+};
+Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
+Unattended-Upgrade::Remove-New-Unused-Dependencies "true";
+Unattended-Upgrade::Remove-Unused-Dependencies "true";
+Unattended-Upgrade::Automatic-Reboot "true";
+Unattended-Upgrade::Automatic-Reboot-WithUsers "true";
+Unattended-Upgrade::Automatic-Reboot-Time "04:00";
+EOF
+cp /etc/fail2ban/jail.conf /etc/fail2ban/jail.local && \
+systemctl enable fail2ban && systemctl restart fail2ban && \
+ufw allow 22/tcp comment 'SSH' && \
+ufw allow 443/tcp comment 'VLESS Reality' && \
+ufw allow 8443/tcp comment 'Remnanode API' && \
+ufw --force enable && \
+systemctl daemon-reload && \
+echo "=== Готово! Перезагрузите сервер: reboot ==="
+```
+
+---
+
+[← Назад к README](README.md) | [Zabbix →](ZABBIX.md) | [Prometheus →](PROMETHEUS.md)
