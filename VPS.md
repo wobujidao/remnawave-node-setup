@@ -710,7 +710,7 @@ To                         Action      From
 --                         ------      ----
 22/tcp                     ALLOW       Anywhere                   # SSH
 443                        ALLOW       Anywhere                   # Xray VPN
-8443/tcp                   ALLOW       95.165.142.229             # Remnanode API
+8443/tcp                   ALLOW       123.45.67.89               # Remnanode API
 22/tcp (v6)                ALLOW       Anywhere (v6)              # SSH
 443 (v6)                   ALLOW       Anywhere (v6)              # Xray VPN
 ```
