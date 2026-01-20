@@ -1,80 +1,92 @@
 # 📈 Мониторинг: Prometheus + Grafana
 
-Инструкция по настройке мониторинга VPN-нод через Prometheus и визуализации в Grafana.
+Инструкция по настройке мониторинга VPN-нод через Prometheus с TLS-шифрованием и визуализации в Grafana.
 
 ## 📋 Содержание
 
 1. [Архитектура](#архитектура)
-2. [Node Exporter на ноде](#node-exporter-на-ноде)
-3. [Firewall на ноде](#firewall-на-ноде)
-4. [Настройка Prometheus Server](#настройка-prometheus-server)
-5. [Настройка Grafana](#настройка-grafana)
-6. [Дашборды](#дашборды)
-7. [Алерты](#алерты)
+2. [Установка Node Exporter](#установка-node-exporter)
+3. [Настройка TLS-шифрования](#настройка-tls-шифрования)
+4. [Firewall на ноде](#firewall-на-ноде)
+5. [Настройка Prometheus Server](#настройка-prometheus-server)
+6. [Настройка Grafana](#настройка-grafana)
+7. [Дашборды](#дашборды)
+8. [Алерты](#алерты)
+9. [Проверка работоспособности](#проверка-работоспособности)
 
 ---
 
 ## Архитектура
 
-```
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│  VPN Node 1 │     │  VPN Node 2 │     │  VPN Node 3 │
-│  :9100      │     │  :9100      │     │  :9100      │
-│  node-exp   │     │  node-exp   │     │  node-exp   │
-└──────┬──────┘     └──────┬──────┘     └──────┬──────┘
-       │                   │                   │
-       └───────────────────┼───────────────────┘
-                           │
-                    ┌──────▼──────┐
-                    │  Prometheus │
-                    │  :9090      │
-                    └──────┬──────┘
-                           │
-                    ┌──────▼──────┐
-                    │   Grafana   │
-                    │  :3000      │
-                    └─────────────┘
+```mermaid
+flowchart TB
+    subgraph nodes["VPN Nodes"]
+        node1["🖥️ VPN Node 1<br/>:9100 TLS<br/>node_exporter"]
+        node2["🖥️ VPN Node 2<br/>:9100 TLS<br/>node_exporter"]
+        node3["🖥️ VPN Node 3<br/>:9100 TLS<br/>node_exporter"]
+    end
+
+    subgraph monitoring["Monitoring Server"]
+        prometheus["📊 Prometheus<br/>:9090"]
+        grafana["📈 Grafana<br/>:3000"]
+    end
+
+    node1 -->|HTTPS| prometheus
+    node2 -->|HTTPS| prometheus
+    node3 -->|HTTPS| prometheus
+    prometheus --> grafana
+
+    style node1 fill:#e1f5fe
+    style node2 fill:#e1f5fe
+    style node3 fill:#e1f5fe
+    style prometheus fill:#fff3e0
+    style grafana fill:#e8f5e9
 ```
 
 ---
 
-## Node Exporter на ноде
+## Установка Node Exporter
 
-### Создание директории
+Node Exporter собирает метрики Linux-системы (CPU, RAM, диск, сеть) и отдаёт их Prometheus.
+
+### Скачивание и установка
 
 ```bash
-mkdir -p /opt/monitoring && cd /opt/monitoring
+cd /tmp
+wget https://github.com/prometheus/node_exporter/releases/download/v1.10.2/node_exporter-1.10.2.linux-amd64.tar.gz
+tar xzf node_exporter-1.10.2.linux-amd64.tar.gz
+mv node_exporter-1.10.2.linux-amd64/node_exporter /usr/local/bin/
 ```
 
-### Docker Compose
+### Создание пользователя
 
 ```bash
-cat > /opt/monitoring/docker-compose.yml << 'EOF'
-services:
-  node-exporter:
-    image: prom/node-exporter:latest
-    container_name: node-exporter
-    restart: always
-    network_mode: host
-    pid: host
-    volumes:
-      - /proc:/host/proc:ro
-      - /sys:/host/sys:ro
-      - /:/rootfs:ro
-    command:
-      - '--path.procfs=/host/proc'
-      - '--path.sysfs=/host/sys'
-      - '--path.rootfs=/rootfs'
-      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
-      - '--web.listen-address=:9100'
+useradd -rs /bin/false node_exporter
+```
+
+### Создание systemd-сервиса (без TLS)
+
+> ⚠️ Этот вариант **без шифрования** — используйте только для тестов или в изолированной сети.
+
+```bash
+cat > /etc/systemd/system/node_exporter.service << 'EOF'
+[Unit]
+Description=Node Exporter
+After=network.target
+
+[Service]
+User=node_exporter
+Group=node_exporter
+Type=simple
+ExecStart=/usr/local/bin/node_exporter
+
+[Install]
+WantedBy=multi-user.target
 EOF
-```
 
-### Запуск
-
-```bash
-cd /opt/monitoring
-docker compose up -d
+systemctl daemon-reload
+systemctl enable node_exporter
+systemctl start node_exporter
 ```
 
 ### Проверка
@@ -85,19 +97,107 @@ curl http://localhost:9100/metrics | head -20
 
 ---
 
+## Настройка TLS-шифрования
+
+Для защиты метрик от перехвата рекомендуется настроить TLS.
+
+### Зачем нужно шифрование
+
+- Метрики содержат информацию о сервере (IP, нагрузка, сеть)
+- Без TLS данные передаются открытым текстом
+- Злоумышленник может перехватить информацию о вашей инфраструктуре
+
+### Создание директории и сертификата
+
+```bash
+mkdir -p /etc/node_exporter
+
+# Генерация self-signed сертификата на 10 лет
+openssl req -new -newkey rsa:2048 -days 3650 -nodes -x509 \
+  -keyout /etc/node_exporter/node_exporter.key \
+  -out /etc/node_exporter/node_exporter.crt \
+  -subj "/CN=<HOSTNAME>" \
+  -addext "subjectAltName = DNS:<HOSTNAME>,IP:<IP_ADDRESS>"
+```
+
+**Замените:**
+- `<HOSTNAME>` — имя хоста (например: `de1-vpn`)
+- `<IP_ADDRESS>` — IP адрес сервера
+
+**Пример:**
+```bash
+openssl req -new -newkey rsa:2048 -days 3650 -nodes -x509 \
+  -keyout /etc/node_exporter/node_exporter.key \
+  -out /etc/node_exporter/node_exporter.crt \
+  -subj "/CN=de1-vpn" \
+  -addext "subjectAltName = DNS:de1-vpn,IP:192.168.1.100"
+```
+
+### Конфигурация TLS
+
+```bash
+cat > /etc/node_exporter/web-config.yml << 'EOF'
+tls_server_config:
+  cert_file: /etc/node_exporter/node_exporter.crt
+  key_file: /etc/node_exporter/node_exporter.key
+EOF
+```
+
+### Установка прав
+
+```bash
+chown -R node_exporter:node_exporter /etc/node_exporter
+chmod 600 /etc/node_exporter/node_exporter.key
+```
+
+### Systemd-сервис с TLS
+
+```bash
+cat > /etc/systemd/system/node_exporter.service << 'EOF'
+[Unit]
+Description=Node Exporter
+After=network.target
+
+[Service]
+User=node_exporter
+Group=node_exporter
+Type=simple
+ExecStart=/usr/local/bin/node_exporter --web.config.file=/etc/node_exporter/web-config.yml
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable node_exporter
+systemctl restart node_exporter
+systemctl status node_exporter
+```
+
+### Проверка TLS
+
+```bash
+curl -k https://localhost:9100/metrics | head -20
+```
+
+✅ Если видите метрики — TLS работает.
+
+---
+
 ## Firewall на ноде
 
-Разрешите доступ только с IP Prometheus Server:
+Разрешите доступ **только с IP Prometheus Server**:
 
 ```bash
 ufw allow from <IP_PROMETHEUS_SERVER> to any port 9100 proto tcp comment 'Node Exporter'
 ```
 
-### Пример
-
+**Пример:**
 ```bash
-ufw allow from 10.10.10.60 to any port 9100 proto tcp comment 'Node Exporter'
+ufw allow from 10.10.10.50 to any port 9100 proto tcp comment 'Node Exporter'
 ```
+
+> ⚠️ **Не открывайте порт 9100 для всех!** Метрики содержат информацию о вашем сервере.
 
 ---
 
@@ -144,20 +244,15 @@ volumes:
 EOF
 ```
 
-### Конфиг Prometheus
+> ⚠️ Замените `<SECURE_PASSWORD>` на надёжный пароль!
+
+### Конфиг Prometheus (без TLS)
 
 ```bash
 cat > /opt/prometheus/prometheus.yml << 'EOF'
 global:
   scrape_interval: 15s
   evaluation_interval: 15s
-
-alerting:
-  alertmanagers:
-    - static_configs:
-        - targets: []
-
-rule_files: []
 
 scrape_configs:
   - job_name: 'prometheus'
@@ -178,7 +273,41 @@ scrape_configs:
 EOF
 ```
 
-> ⚠️ Замените `<NODE_X_IP>` на реальные IP адреса ваших нод.
+### Конфиг Prometheus (с TLS)
+
+Если на нодах настроен TLS:
+
+```bash
+cat > /opt/prometheus/prometheus.yml << 'EOF'
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  - job_name: 'vpn-nodes'
+    scheme: https
+    tls_config:
+      insecure_skip_verify: true
+    static_configs:
+      - targets:
+        - '<NODE_1_IP>:9100'
+        - '<NODE_2_IP>:9100'
+        - '<NODE_3_IP>:9100'
+        labels:
+          type: 'vpn'
+    relabel_configs:
+      - source_labels: [__address__]
+        regex: '(.*):\d+'
+        target_label: instance
+        replacement: '${1}'
+EOF
+```
+
+> 💡 `insecure_skip_verify: true` — пропускает проверку сертификата (для self-signed). В продакшене лучше использовать доверенные сертификаты.
 
 ### Запуск
 
@@ -280,6 +409,8 @@ groups:
 
 ### Обновление prometheus.yml
 
+Добавьте в конфиг:
+
 ```yaml
 rule_files:
   - 'alerts.yml'
@@ -293,35 +424,86 @@ curl -X POST http://localhost:9090/-/reload
 
 ---
 
-## 🔧 Быстрая установка Node Exporter на ноде
+## Проверка работоспособности
+
+### На ноде
 
 ```bash
-mkdir -p /opt/monitoring && cd /opt/monitoring && \
-cat > docker-compose.yml << 'EOF'
-services:
-  node-exporter:
-    image: prom/node-exporter:latest
-    container_name: node-exporter
-    restart: always
-    network_mode: host
-    pid: host
-    volumes:
-      - /proc:/host/proc:ro
-      - /sys:/host/sys:ro
-      - /:/rootfs:ro
-    command:
-      - '--path.procfs=/host/proc'
-      - '--path.sysfs=/host/sys'
-      - '--path.rootfs=/rootfs'
-      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
-      - '--web.listen-address=:9100'
-EOF
-docker compose up -d && \
-ufw allow from <IP_PROMETHEUS_SERVER> to any port 9100 proto tcp comment 'Node Exporter' && \
-echo "=== Node Exporter установлен ==="
+# Статус сервиса
+systemctl status node_exporter
+
+# Проверка метрик (без TLS)
+curl http://localhost:9100/metrics | head
+
+# Проверка метрик (с TLS)
+curl -k https://localhost:9100/metrics | head
+
+# Проверка сертификата
+openssl s_client -connect localhost:9100 -tls1_2 </dev/null 2>&1 | grep -E "(Protocol|Cipher)"
 ```
 
-> ⚠️ Замените `<IP_PROMETHEUS_SERVER>` перед выполнением!
+### На Prometheus Server
+
+```bash
+# Проверка targets
+curl http://localhost:9090/api/v1/targets | jq '.data.activeTargets[] | {instance: .labels.instance, health: .health}'
+
+# Или в веб-интерфейсе
+# http://<IP_SERVER>:9090/targets
+```
+
+### В Grafana
+
+1. **Dashboards** → выберите дашборд
+2. Проверьте что данные отображаются
+3. Если нет данных — проверьте Data Source и targets в Prometheus
+
+---
+
+## 🔧 Быстрая установка Node Exporter с TLS
+
+> ⚠️ Замените `<HOSTNAME>`, `<IP_ADDRESS>` и `<IP_PROMETHEUS_SERVER>` перед выполнением!
+
+```bash
+cd /tmp && \
+wget https://github.com/prometheus/node_exporter/releases/download/v1.10.2/node_exporter-1.10.2.linux-amd64.tar.gz && \
+tar xzf node_exporter-1.10.2.linux-amd64.tar.gz && \
+mv node_exporter-1.10.2.linux-amd64/node_exporter /usr/local/bin/ && \
+useradd -rs /bin/false node_exporter && \
+mkdir -p /etc/node_exporter && \
+openssl req -new -newkey rsa:2048 -days 3650 -nodes -x509 \
+  -keyout /etc/node_exporter/node_exporter.key \
+  -out /etc/node_exporter/node_exporter.crt \
+  -subj "/CN=<HOSTNAME>" \
+  -addext "subjectAltName = DNS:<HOSTNAME>,IP:<IP_ADDRESS>" && \
+cat > /etc/node_exporter/web-config.yml << 'EOF'
+tls_server_config:
+  cert_file: /etc/node_exporter/node_exporter.crt
+  key_file: /etc/node_exporter/node_exporter.key
+EOF
+chown -R node_exporter:node_exporter /etc/node_exporter && \
+chmod 600 /etc/node_exporter/node_exporter.key && \
+cat > /etc/systemd/system/node_exporter.service << 'EOF'
+[Unit]
+Description=Node Exporter
+After=network.target
+
+[Service]
+User=node_exporter
+Group=node_exporter
+Type=simple
+ExecStart=/usr/local/bin/node_exporter --web.config.file=/etc/node_exporter/web-config.yml
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload && \
+systemctl enable node_exporter && \
+systemctl start node_exporter && \
+ufw allow from <IP_PROMETHEUS_SERVER> to any port 9100 proto tcp comment 'Node Exporter' && \
+echo "=== Node Exporter с TLS установлен ===" && \
+curl -k https://localhost:9100/metrics | head -5
+```
 
 ---
 
@@ -373,28 +555,41 @@ irate(node_network_transmit_bytes_total{device="eth0"}[5m])
 ### Node Exporter не отвечает
 
 ```bash
-# Проверка контейнера
-docker ps | grep node-exporter
-docker logs node-exporter
+# Проверка сервиса
+systemctl status node_exporter
+journalctl -u node_exporter -f
 
 # Проверка порта
 ss -tlpn | grep 9100
 
 # Тест локально
 curl http://localhost:9100/metrics
+curl -k https://localhost:9100/metrics
 ```
 
 ### Prometheus не видит ноду
 
-1. Проверьте firewall на ноде
+1. Проверьте firewall на ноде: `ufw status`
 2. Проверьте URL в prometheus.yml
 3. Проверьте статус в Prometheus UI → Status → Targets
+4. Если TLS — убедитесь что в конфиге `scheme: https`
+
+### Ошибка TLS
+
+```
+TLS error from peer (alert code 47)
+```
+
+Проверьте:
+1. Сертификат существует: `ls -la /etc/node_exporter/`
+2. Права на ключ: `chmod 600 /etc/node_exporter/node_exporter.key`
+3. Владелец файлов: `chown -R node_exporter:node_exporter /etc/node_exporter`
 
 ### Grafana не показывает данные
 
-1. Проверьте Data Source
-2. Проверьте временной диапазон
-3. Проверьте запрос в панели
+1. Проверьте Data Source → Test
+2. Проверьте временной диапазон в дашборде
+3. Проверьте что Prometheus получает метрики (Targets)
 
 ---
 
