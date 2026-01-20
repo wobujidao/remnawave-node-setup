@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/remnawave/frontend/main/public/android-chrome-192x192.png" alt="Remnawave Logo" width="120"/>
+  <img src="https://cdn.remna.st/logos/logo.svg" alt="Remnawave Logo" width="200"/>
 </p>
 
 <h1 align="center">🚀 Remnawave Node Setup Guide</h1>
@@ -21,6 +21,15 @@
   <img src="https://img.shields.io/badge/Docker-Ready-2496ED?style=for-the-badge&logo=docker&logoColor=white" alt="Docker"/>
   <img src="https://img.shields.io/badge/Xray-VLESS_Reality-00C7B7?style=for-the-badge&logo=v2ray&logoColor=white" alt="Xray"/>
   <img src="https://img.shields.io/badge/License-MIT-green?style=for-the-badge" alt="License"/>
+</p>
+
+<p align="center">
+  <a href="https://github.com/wobujidao/remnawave-node-setup/stargazers">
+    <img src="https://img.shields.io/github/stars/wobujidao/remnawave-node-setup?style=social" alt="Stars"/>
+  </a>
+  <a href="https://github.com/wobujidao/remnawave-node-setup/network/members">
+    <img src="https://img.shields.io/github/forks/wobujidao/remnawave-node-setup?style=social" alt="Forks"/>
+  </a>
 </p>
 
 ---
@@ -112,7 +121,7 @@ Reality — это современная технология маскиров�
 
 ```bash
 # 1. Скачайте и выполните скрипт подготовки
-curl -sSL https://raw.githubusercontent.com/username/remnawave-node-setup/main/scripts/setup.sh | bash
+curl -sSL https://raw.githubusercontent.com/wobujidao/remnawave-node-setup/main/scripts/setup.sh | bash
 
 # 2. Перезагрузите сервер
 reboot
@@ -232,7 +241,7 @@ flowchart LR
 </p>
 
 <p align="center">
-  <a href="https://github.com/username/remnawave-node-setup/stargazers">
-    <img src="https://img.shields.io/github/stars/username/remnawave-node-setup?style=social" alt="Stars"/>
+  <a href="https://github.com/wobujidao/remnawave-node-setup/stargazers">
+    <img src="https://img.shields.io/github/stars/wobujidao/remnawave-node-setup?style=social" alt="Stars"/>
   </a>
 </p>
