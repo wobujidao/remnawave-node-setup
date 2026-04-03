@@ -14,7 +14,8 @@
 10. [Настройка логирования](#10-настройка-логирования)
 11. [Настройка в панели Remnawave](#11-настройка-в-панели-remnawave)
 12. [Проверка работоспособности](#12-проверка-работоспособности)
-13. [Проверка и очистка Firewall](#13-проверка-и-очистка-firewall)
+13. [Диагностика проблем](#13-диагностика-проблем)
+14. [Проверка и очистка Firewall](#14-проверка-и-очистка-firewall)
 
 ---
 
@@ -459,10 +460,29 @@ docker compose up -d && docker compose logs -f -t
 
 ```bash
 cat > /etc/cron.d/remnawave-update << 'EOF'
-0 11 * * 6 root cd /opt/remnanode && docker compose pull -q && docker compose down && docker compose up -d >> /var/log/remnawave-update.log 2>&1
+0 11 * * 6 root cd /opt/remnanode && echo "=== $(date) ===" >> /var/log/remnawave-update.log && docker compose pull >> /var/log/remnawave-update.log 2>&1 && docker compose down >> /var/log/remnawave-update.log 2>&1 && docker compose up -d >> /var/log/remnawave-update.log 2>&1 && docker image prune -f >> /var/log/remnawave-update.log 2>&1
 EOF
 chmod 644 /etc/cron.d/remnawave-update
 ```
+
+**Что записывается в лог:**
+- Дата и время запуска
+- Результат `docker compose pull` — видно, скачался ли новый образ
+- Результат перезапуска контейнера
+- Результат очистки старых образов (`docker image prune`)
+
+**Пример хорошего лога** (`cat /var/log/remnawave-update.log`):
+```
+=== Sat Apr 05 11:00:01 MSK 2026 ===
+ ✔ remnanode Pulled   8.2s
+ ✔ Container remnanode  Removed
+ ✔ Container remnanode  Started
+Deleted Images:
+deleted: sha256:14bf541e30b1...
+Total reclaimed space: 285MB
+```
+
+> ⚠️ **Важно: риск рассинхрона версий.** Если панель Remnawave обновится и начнёт требовать новую версию ноды между запусками крона — нода перестанет получать конфигурацию от панели, Xray не запустится, и VPN перестанет работать. Нода при этом будет выглядеть работающей (`docker ps` покажет контейнер UP), но в логах не будет строки `Xray started`. Подробнее о диагностике — в [разделе 13](#13-диагностика-проблем).
 
 ---
 
@@ -643,8 +663,35 @@ resolvectl status | grep -E "DNSOverTLS|Current DNS"
 ### 12.2 Проверка Xray
 
 ```bash
+# Логи контейнера — должна быть строка "Xray started"
 docker logs remnanode --tail 30
+
+# Процесс xray внутри контейнера — должен быть в списке
+docker exec remnanode ps aux
+# Ожидается: процесс xray в выводе (помимо node и supervisord)
+
+# Xray слушает на порту 443
+ss -tulpn | grep xray
+# Ожидается: LISTEN на :443
+
+# Панель подключена к ноде
+ss -tn | grep 8443
+# Ожидается: ESTABLISHED соединение от IP панели
 ```
+
+**Признаки что всё работает:**
+- В `docker logs` есть строка `Xray started` и `Starting user extraction from inbounds`
+- `docker exec remnanode ps aux` показывает процесс `xray` (а не только `node` и `supervisord`)
+- `ss -tulpn | grep xray` показывает listener на порту 443
+- `ss -tn | grep 8443` показывает активное соединение от IP панели
+
+**Признаки проблемы:**
+- В `docker logs` **нет** строки `Xray started`
+- `docker exec remnanode ps aux` показывает **только** `node` и `supervisord`, без `xray`
+- `ss -tulpn | grep xray` — **пустой вывод**
+- `ss -tn | grep 8443` — **пустой вывод** (панель не подключена)
+
+> Если видите признаки проблемы — переходите к [разделу 13](#13-диагностика-проблем).
 
 ### 12.3 Проверка логов
 
@@ -661,11 +708,147 @@ tail -f /var/log/remnanode/access.log
 
 ---
 
-## 13. Проверка и очистка Firewall
+## 13. Диагностика проблем
+
+### 13.1 VPN подключается, но ничего не открывается
+
+**Шаг 1: Проверить запущен ли Xray**
+
+```bash
+docker exec remnanode ps aux
+```
+
+Если в выводе **нет процесса `xray`** — только `node` и `supervisord` — значит Xray не получил конфигурацию от панели.
+
+**Шаг 2: Проверить связь панели с нодой**
+
+```bash
+ss -tn | grep 8443
+```
+
+Если вывод **пустой** — панель не подключается к ноде. Возможные причины:
+- NODE_PORT (8443) заблокирован в UFW
+- IP панели изменился (если панель на домашнем IP)
+- Панель не работает
+
+**Шаг 3: Проверить логи на ошибки**
+
+```bash
+docker logs remnanode 2>&1 | grep -iE "error|warn|fail|inbound|Xray started" | tail -20
+```
+
+**Шаг 4: Проверить конфиг Xray**
+
+```bash
+docker exec remnanode cat /usr/local/etc/xray/config.json 2>&1
+```
+
+Если файл **не существует** — панель не отправила конфигурацию.
+
+### 13.2 Нода отстала по версии от панели
+
+**Симптомы:**
+- Контейнер работает (`docker ps` показывает UP)
+- В логах **нет** строки `Xray started` и `Starting user extraction from inbounds`
+- Панель показывает ноду как Offline или выдаёт ошибку версии
+- `ss -tn | grep 8443` — пустой (панель отказывается подключаться)
+
+**Причина:** Панель Remnawave обновилась и требует новую версию ноды, а нода ещё на старой версии.
+
+**Решение:**
+
+```bash
+cd /opt/remnanode
+docker compose pull
+docker compose down
+docker compose up -d
+sleep 15
+docker logs remnanode 2>&1 | grep -iE "inbound|Xray started|version"
+```
+
+**Как проверить текущую версию ноды:**
+
+```bash
+docker logs remnanode 2>&1 | grep "Remnawave Node"
+```
+
+Пример: `Remnawave Node v2.7.0` — сравните с требованиями панели.
+
+**Профилактика:** Cron автообновления (раздел 9.6) снижает вероятность рассинхрона, но не исключает его полностью. Если панель обновится между запусками крона — нода отстанет. В этом случае обновите вручную командами выше.
+
+### 13.3 NODE_PORT закрыт в UFW
+
+**Симптом:** Нода работает, но панель не подключается (`ss -tn | grep 8443` пустой).
+
+**Проверка:**
+
+```bash
+ufw status | grep 8443
+```
+
+Если правила нет — добавьте:
+
+```bash
+ufw allow from <IP_REMNAWAVE_PANEL> to any port 8443 proto tcp comment 'Remnanode API'
+```
+
+> ⚠️ **Не удаляйте это правило!** Без него панель потеряет связь с нодой, Xray перестанет получать конфигурацию и VPN перестанет работать.
+
+### 13.4 Быстрая диагностика одной командой
+
+```bash
+echo "=== Версия ноды ==="
+docker logs remnanode 2>&1 | grep "Remnawave Node" | tail -1
+
+echo ""
+echo "=== Xray запущен? ==="
+docker exec remnanode ps aux 2>&1 | grep -q xray && echo "✅ Xray работает" || echo "❌ Xray НЕ запущен"
+
+echo ""
+echo "=== Xray слушает порт? ==="
+ss -tulpn | grep xray || echo "❌ Xray не слушает ни на одном порту"
+
+echo ""
+echo "=== Панель подключена? ==="
+ss -tn | grep 8443 | grep ESTAB && echo "✅ Панель подключена" || echo "❌ Панель НЕ подключена"
+
+echo ""
+echo "=== Последние ошибки ==="
+docker logs remnanode 2>&1 | grep -iE "error|fail" | tail -5
+
+echo ""
+echo "=== UFW — порт 8443 ==="
+ufw status | grep 8443 || echo "❌ Порт 8443 не открыт в UFW!"
+```
+
+### 13.5 Docker не пускает трафик
+
+**Симптом:** Xray запущен и слушает порт, но клиенты не могут подключиться.
+
+**Проверка FORWARD chain:**
+
+```bash
+iptables -L FORWARD -n -v --line-numbers | head -15
+```
+
+Если политика `DROP` и нет правил для Docker — трафик блокируется.
+
+**Проверка изнутри контейнера:**
+
+```bash
+docker exec remnanode ping -c 2 1.1.1.1
+docker exec remnanode nslookup google.com
+```
+
+Если пинг проходит, а DNS резолвится — сеть контейнера в порядке.
+
+---
+
+## 14. Проверка и очистка Firewall
 
 После настройки рекомендуется проверить что в UFW нет лишних правил.
 
-### 13.1 Сравнение портов
+### 14.1 Сравнение портов
 
 ```bash
 # Что реально слушает на сервере
@@ -677,7 +860,7 @@ ufw status
 
 **Принцип:** Если порт открыт в UFW, но ничего не слушает на этом порту — правило лишнее.
 
-### 13.2 Удаление лишних портов
+### 14.2 Удаление лишних портов
 
 ```bash
 ufw delete allow <PORT>
@@ -689,7 +872,7 @@ ufw delete allow 8080/tcp
 ufw delete allow 80/tcp
 ```
 
-### 13.3 Добавление комментариев к правилам
+### 14.3 Добавление комментариев к правилам
 
 Если правило без комментария — пересоздайте с комментарием:
 
@@ -701,7 +884,7 @@ ufw delete allow 443
 ufw allow 443 comment 'Xray VPN'
 ```
 
-### 13.4 Эталонный вид UFW для VPN-ноды
+### 14.4 Эталонный вид UFW для VPN-ноды
 
 ```
 Status: active
@@ -794,7 +977,7 @@ cat > /etc/logrotate.d/remnanode << 'EOF'
 }
 EOF
 cat > /etc/cron.d/remnawave-update << 'EOF'
-0 11 * * 6 root cd /opt/remnanode && docker compose pull -q && docker compose down && docker compose up -d >> /var/log/remnawave-update.log 2>&1
+0 11 * * 6 root cd /opt/remnanode && echo "=== $(date) ===" >> /var/log/remnawave-update.log && docker compose pull >> /var/log/remnawave-update.log 2>&1 && docker compose down >> /var/log/remnawave-update.log 2>&1 && docker compose up -d >> /var/log/remnawave-update.log 2>&1 && docker image prune -f >> /var/log/remnawave-update.log 2>&1
 EOF
 chmod 644 /etc/cron.d/remnawave-update && \
 systemctl daemon-reload && \
